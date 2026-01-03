@@ -1,0 +1,334 @@
+SELECT COUNT(*) FROM raw_order_items;
+SELECT COUNT(*) FROM raw_order_item_options;
+
+
+SELECT COUNT(*) FROM raw_order_items;
+SELECT COUNT(*) FROM raw_order_item_options;
+
+
+SELECT
+  clv_segment,
+  COUNT(*) AS customers,
+  ROUND(AVG(clv), 2) AS avg_clv
+FROM customer_clv_segment
+GROUP BY clv_segment;
+
+
+
+
+CREATE EXTERNAL TABLE IF NOT EXISTS customer_clv_segment (
+    customer_id    string,
+    snapshot_date  date,
+    total_orders   bigint,
+    total_revenue  double,
+    clv            double,
+    clv_segment    string
+)
+STORED AS PARQUET
+LOCATION 's3://globalpartners-business-analysis/analytics/customer_clv_segment/';
+
+
+
+CREATE EXTERNAL TABLE IF NOT EXISTS customer_rfm (
+    customer_id     string,
+    recency_days    int,
+    frequency       int,
+    monetary        double,
+    rfm_score       string,
+    rfm_segment     string
+)
+STORED AS PARQUET
+LOCATION 's3://globalpartners-business-analysis/analytics/customer_rfm/';
+
+
+
+CREATE EXTERNAL TABLE IF NOT EXISTS customer_churn (
+    customer_id                string,
+    last_order_date            date,
+    days_since_last_order      int,
+    avg_gap_between_orders     double,
+    spend_trend_pct            double,
+    churn_status               string
+)
+STORED AS PARQUET
+LOCATION 's3://globalpartners-business-analysis/analytics/customer_churn/';
+
+
+
+CREATE EXTERNAL TABLE IF NOT EXISTS discount_effectiveness (
+    discount_flag     string,
+    total_orders      bigint,
+    total_revenue     double,
+    avg_order_value   double
+)
+STORED AS PARQUET
+LOCATION 's3://globalpartners-business-analysis/analytics/discount_effectiveness/';
+
+
+
+CREATE EXTERNAL TABLE IF NOT EXISTS location_performance (
+    restaurant_id      string,
+    total_orders       bigint,
+    total_revenue      double,
+    avg_order_value    double,
+    orders_per_day     double,
+    revenue_rank       int
+)
+STORED AS PARQUET
+LOCATION 's3://globalpartners-business-analysis/analytics/location_performance/';
+
+DROP TABLE discount_effectiveness;
+
+
+CREATE EXTERNAL TABLE discount_effectiveness (
+    discount_flag      boolean,
+    total_orders       bigint,
+    total_revenue      double,
+    avg_order_value    double
+)
+STORED AS PARQUET
+LOCATION 's3://globalpartners-business-analysis/analytics/discount_effectiveness/';
+
+
+SELECT
+  customer_id,
+  clv,
+  clv_segment
+FROM customer_clv_segment
+WHERE customer_id IS NOT NULL
+LIMIT 10;
+
+
+
+
+CREATE TABLE customer_clv_segment_v2
+WITH (
+    format = 'PARQUET',
+    external_location = 's3://globalpartners-business-analysis/analytics/customer_clv_segment_v2/'
+) AS
+
+WITH base_orders AS (
+    SELECT
+        CAST(user_id AS varchar) AS customer_id,
+        CAST(from_iso8601_timestamp(creation_time_utc) AS date) AS snapshot_date,
+        order_id,
+        lineitem_id,
+        item_price * item_quantity AS item_revenue
+    FROM globalpartners_db.raw_order_items
+),
+
+option_revenue AS (
+    SELECT
+        order_id,
+        lineitem_id,
+        SUM(option_price * option_quantity) AS option_revenue
+    FROM globalpartners_db.raw_order_item_options
+    GROUP BY order_id, lineitem_id
+),
+
+daily_revenue AS (
+    SELECT
+        b.customer_id,
+        b.snapshot_date,
+        SUM(b.item_revenue + COALESCE(o.option_revenue, 0)) AS daily_revenue,
+        COUNT(DISTINCT b.order_id) AS daily_orders
+    FROM base_orders b
+    LEFT JOIN option_revenue o
+        ON b.order_id = o.order_id
+       AND b.lineitem_id = o.lineitem_id
+    GROUP BY b.customer_id, b.snapshot_date
+),
+
+cumulative_clv AS (
+    SELECT
+        customer_id,
+        snapshot_date,
+        SUM(daily_revenue) OVER (
+            PARTITION BY customer_id
+            ORDER BY snapshot_date
+            ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+        ) AS clv,
+        SUM(daily_orders) OVER (
+            PARTITION BY customer_id
+            ORDER BY snapshot_date
+            ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+        ) AS total_orders
+    FROM daily_revenue
+),
+
+latest_clv AS (
+    SELECT
+        customer_id,
+        clv,
+        ROW_NUMBER() OVER (
+            PARTITION BY customer_id
+            ORDER BY snapshot_date DESC
+        ) AS rn
+    FROM cumulative_clv
+),
+
+thresholds AS (
+    SELECT
+        approx_percentile(clv, 0.2) AS low_cutoff,
+        approx_percentile(clv, 0.8) AS high_cutoff
+    FROM latest_clv
+    WHERE rn = 1
+)
+
+SELECT
+    c.customer_id,
+    c.snapshot_date,
+    c.total_orders,
+    c.clv,
+    CASE
+        WHEN c.clv >= t.high_cutoff THEN 'High'
+        WHEN c.clv <= t.low_cutoff  THEN 'Low'
+        ELSE 'Medium'
+    END AS clv_segment
+FROM cumulative_clv c
+CROSS JOIN thresholds t;
+
+
+
+
+SELECT customer_id, clv, clv_segment
+FROM customer_clv_segment_v2
+WHERE customer_id IS NOT NULL
+LIMIT 10;
+
+
+
+
+CREATE TABLE customer_rfm_v2
+WITH (
+    format = 'PARQUET',
+    external_location = 's3://globalpartners-business-analysis/analytics/customer_rfm_v2/'
+) AS
+
+WITH orders AS (
+    SELECT
+        CAST(user_id AS varchar) AS customer_id,
+        CAST(from_iso8601_timestamp(creation_time_utc) AS date) AS order_date,
+        order_id,
+        item_price * item_quantity AS revenue
+    FROM globalpartners_db.raw_order_items
+),
+
+customer_agg AS (
+    SELECT
+        customer_id,
+        MAX(order_date) AS last_order_date,
+        COUNT(DISTINCT order_id) AS frequency,
+        SUM(revenue) AS monetary
+    FROM orders
+    GROUP BY customer_id
+),
+
+rfm_base AS (
+    SELECT
+        customer_id,
+        date_diff('day', last_order_date, CURRENT_DATE) AS recency_days,
+        frequency,
+        monetary
+    FROM customer_agg
+)
+
+SELECT
+    customer_id,
+    recency_days,
+    frequency,
+    monetary,
+    CASE
+        WHEN recency_days <= 30 AND frequency >= 5 AND monetary >= 200 THEN 'VIP'
+        WHEN recency_days <= 30 AND frequency < 5 THEN 'New Customers'
+        WHEN recency_days > 45 THEN 'Churn Risk'
+        ELSE 'Regular'
+    END AS rfm_segment
+FROM rfm_base;
+
+
+
+SELECT rfm_segment, COUNT(*)
+FROM customer_rfm_v2
+GROUP BY rfm_segment;
+
+
+CREATE TABLE customer_churn_v2
+WITH (
+    format = 'PARQUET',
+    external_location = 's3://globalpartners-business-analysis/analytics/customer_churn_v2/'
+) AS
+
+WITH orders AS (
+    SELECT
+        CAST(user_id AS varchar) AS customer_id,
+        CAST(from_iso8601_timestamp(creation_time_utc) AS date) AS order_date,
+        order_id,
+        item_price * item_quantity AS revenue
+    FROM globalpartners_db.raw_order_items
+),
+
+order_gaps AS (
+    SELECT
+        customer_id,
+        order_date,
+        LAG(order_date) OVER (
+            PARTITION BY customer_id ORDER BY order_date
+        ) AS prev_order_date
+    FROM orders
+),
+
+gap_metrics AS (
+    SELECT
+        customer_id,
+        AVG(date_diff('day', prev_order_date, order_date)) AS avg_gap_between_orders
+    FROM order_gaps
+    WHERE prev_order_date IS NOT NULL
+    GROUP BY customer_id
+),
+
+customer_summary AS (
+    SELECT
+        customer_id,
+        MAX(order_date) AS last_order_date,
+        SUM(revenue) AS total_revenue
+    FROM orders
+    GROUP BY customer_id
+),
+
+recent_spend AS (
+    SELECT
+        customer_id,
+        SUM(revenue) AS recent_revenue
+    FROM orders
+    WHERE order_date >= date_add('day', -30, CURRENT_DATE)
+    GROUP BY customer_id
+),
+
+prior_spend AS (
+    SELECT
+        customer_id,
+        SUM(revenue) AS prior_revenue
+    FROM orders
+    WHERE order_date BETWEEN date_add('day', -60, CURRENT_DATE)
+                          AND date_add('day', -31, CURRENT_DATE)
+    GROUP BY customer_id
+)
+
+SELECT
+    c.customer_id,
+    c.last_order_date,
+    date_diff('day', c.last_order_date, CURRENT_DATE) AS days_since_last_order,
+    g.avg_gap_between_orders,
+    CASE
+        WHEN p.prior_revenue IS NULL OR p.prior_revenue = 0 THEN NULL
+        ELSE (r.recent_revenue - p.prior_revenue) / p.prior_revenue
+    END AS spend_trend_pct,
+    CASE
+        WHEN date_diff('day', c.last_order_date, CURRENT_DATE) > 45 THEN 'At Risk'
+        ELSE 'Active'
+    END AS churn_status
+FROM customer_summary c
+LEFT JOIN gap_metrics g ON c.customer_id = g.customer_id
+LEFT JOIN recent_spend r ON c.customer_id = r.customer_id
+LEFT JOIN prior_spend p ON c.customer_id = p.customer_id;
