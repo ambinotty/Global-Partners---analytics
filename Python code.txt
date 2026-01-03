@@ -1,0 +1,112 @@
+import sys
+from pyspark.context import SparkContext
+from awsglue.context import GlueContext
+from pyspark.sql import functions as F
+from pyspark.sql.window import Window
+
+sc = SparkContext()
+glueContext = GlueContext(sc)
+spark = glueContext.spark_session
+
+bucket = "globalpartners-business-analysis"
+
+# ------------ READ CURATED LAYERS ------------
+fact_orders_path = f"s3://{bucket}/curated/fact_orders/"
+dim_customer_path = f"s3://{bucket}/curated/dim_customer/"
+fact_items_path = f"s3://{bucket}/curated/fact_order_items/"
+cust_daily_clv_path = f"s3://{bucket}/curated/customer_daily_clv/"
+
+df_orders = spark.read.parquet(fact_orders_path)
+df_customers = spark.read.parquet(dim_customer_path)
+df_items = spark.read.parquet(fact_items_path)
+df_clv_daily = spark.read.parquet(cust_daily_clv_path)
+
+# ------------ CUSTOMER CLV SEGMENTATION ------------
+# Get total lifetime revenue per customer
+df_clv = (
+    df_clv_daily
+    .groupBy("USER_ID")
+    .agg(F.max("CUMULATIVE_REVENUE_TO_DATE").alias("TOTAL_LTV"))
+)
+
+# Rank customers
+w = Window.orderBy(F.col("TOTAL_LTV").desc())
+df_ltv_ranked = df_clv.withColumn("RANK", F.row_number().over(w))
+
+# Count total customers
+total_customers = df_clv.count()
+
+# Calculate 20%/60%/20% split
+high_cutoff = int(total_customers * 0.2)
+low_cutoff = int(total_customers * 0.8)
+
+df_clv_segment = df_ltv_ranked.withColumn(
+    "CLV_SEGMENT",
+    F.when(F.col("RANK") <= high_cutoff, "HIGH")
+     .when(F.col("RANK") <= low_cutoff, "MEDIUM")
+     .otherwise("LOW")
+)
+
+# ------------ RFM SCORING ------------
+# Recency = days since last purchase
+df_rfm = (
+    df_orders
+    .groupBy("USER_ID")
+    .agg(
+        F.max("ORDER_DATE").alias("LAST_ORDER_DATE"),
+        F.count("ORDER_ID").alias("FREQUENCY"),
+        F.sum("ORDER_REVENUE").alias("MONETARY")
+    )
+)
+
+# Add recency in days
+max_date = df_orders.agg(F.max("ORDER_DATE")).collect()[0][0]
+df_rfm = df_rfm.withColumn(
+    "RECENCY",
+    F.datediff(F.lit(max_date), F.col("LAST_ORDER_DATE"))
+)
+
+# ------------ CHURN SIGNALS ------------
+df_churn = (
+    df_rfm
+    .withColumn("AVG_ORDER_GAP", F.col("RECENCY") / F.col("FREQUENCY"))
+    .withColumn(
+        "CHURN_RISK",
+        F.when(F.col("RECENCY") > 45, "HIGH")
+         .when(F.col("RECENCY") > 30, "MEDIUM")
+         .otherwise("LOW")
+    )
+)
+
+# ------------ LOCATION PERFORMANCE ------------
+df_location = (
+    df_orders
+    .groupBy("RESTAURANT_ID")
+    .agg(
+        F.sum("ORDER_REVENUE").alias("TOTAL_REVENUE"),
+        F.countDistinct("ORDER_ID").alias("TOTAL_ORDERS"),
+        F.avg("ORDER_REVENUE").alias("AVG_ORDER_VALUE")
+    )
+)
+
+# ------------ DISCOUNT EFFECTIVENESS ------------
+df_discount = (
+    df_items
+    .withColumn("DISCOUNT_FLAG", F.col("OPTION_PRICE_TOTAL") < 0)
+    .groupBy("DISCOUNT_FLAG")
+    .agg(
+        F.sum("LINE_REVENUE").alias("TOTAL_REVENUE"),
+        F.countDistinct("ORDER_ID").alias("TOTAL_ORDERS")
+    )
+)
+
+# ------------ WRITE ANALYTICS OUTPUT LAYERS ------------
+analytics_base = f"s3://{bucket}/analytics/"
+
+df_clv_segment.write.mode("overwrite").parquet(analytics_base + "customer_clv_segment/")
+df_rfm.write.mode("overwrite").parquet(analytics_base + "customer_rfm/")
+df_churn.write.mode("overwrite").parquet(analytics_base + "customer_churn/")
+df_location.write.mode("overwrite").parquet(analytics_base + "location_performance/")
+df_discount.write.mode("overwrite").parquet(analytics_base + "discount_effectiveness/")
+
+print("Analytics layer created successfully.")
